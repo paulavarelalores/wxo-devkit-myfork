@@ -1,64 +1,77 @@
 import logging
 import uuid
 import time
+import asyncio
+import json
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, Header, Depends
-from fastapi.responses import JSONResponse, StreamingResponse
-from models import ChatCompletionRequest, ChatCompletionResponse, Choice, MessageResponse, DEFAULT_MODEL
+
+from fastapi import FastAPI, Header, Depends, Request
+from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
+
+from models import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Choice,
+    MessageResponse,
+    DEFAULT_MODEL,
+)
 from security import get_current_user
 from tools import web_search_duckduckgo, news_search_duckduckgo
-from llm_utils import get_llm_sync, get_llm_stream
+from llm_utils import get_llm_stream
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+# ─── Logger setup ───────────────────────────────────────────────────────────────
+logger = logging.getLogger("external-agent")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+)
+logger.addHandler(handler)
 
+# ─── App init ───────────────────────────────────────────────────────────────────
 app = FastAPI()
 
+# ─── Test SSE endpoint ──────────────────────────────────────────────────────────
+@app.post("/chat/completions-test")
+async def completions_test(_req: Request):
+    """
+    Quick endpoint to verify SSE is working.
+    """
+    async def publisher():
+        yield 'data: {"choices":[{"delta":{"content":"👋 test"}}]}\n\n'
+        await asyncio.sleep(0.5)
+        yield 'data: {"choices":[{"delta":{"content":" success"}}]}\n\n'
+    return EventSourceResponse(publisher())
+
+# ─── Main chat/completions ──────────────────────────────────────────────────────
 @app.post("/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
-    X_IBM_THREAD_ID: Optional[str] = Header(None, alias="X-IBM-THREAD-ID", description="Optional header to specify the thread ID"),
+    X_IBM_THREAD_ID: Optional[str] = Header(
+        None, alias="X-IBM-THREAD-ID", description="Optional thread ID"
+    ),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    logger.info(f"Received POST /chat/completions ChatCompletionRequest: {request.json()}")
-    thread_id = ''
-    if  X_IBM_THREAD_ID:
-        thread_id =  X_IBM_THREAD_ID
-    if request.extra_body and request.extra_body.thread_id:
-        thread_id = request.extra_body.thread_id
-    logger.info("thread_id: " + thread_id)
-    model = DEFAULT_MODEL
-    if request.model:
-        model = request.model
-    selected_tools = [web_search_duckduckgo, news_search_duckduckgo]
-    if request.stream:
-        return StreamingResponse(get_llm_stream(request.messages, model, thread_id, selected_tools), media_type="text/event-stream")
-    else:
-        last_message, all_messages = get_llm_sync(request.messages, model, thread_id, selected_tools)
-        id = str(uuid.uuid4())
-        response = ChatCompletionResponse(
-            id=id,
-            object="chat.completion",
-            created=int(time.time()),
-            model=request.model,
-            choices=[
-                Choice(
-                    index=0,
-                    message=MessageResponse(
-                        role="assistant",
-                        content=last_message
-                    ),
-                    finish_reason="stop"
-                )
-            ]
-        )
-        return JSONResponse(content=response.dict())
+    logger.info(f"Received request: {request.json()}")
+    # determine thread_id
+    thread_id = X_IBM_THREAD_ID or (request.extra_body.thread_id if request.extra_body else "")
+    logger.info(f"Using thread_id: {thread_id}")
 
-if __name__ == '__main__':
+    model = request.model or DEFAULT_MODEL
+    selected_tools = [web_search_duckduckgo, news_search_duckduckgo]
+
+    # ALWAYS stream as SSE
+    async def sse_publisher():
+        async for token in get_llm_stream(request.messages, model, thread_id, selected_tools):
+            logger.debug(f"Yielding chunk: {token!r}")
+            payload = {"choices":[{"delta":{"content":token}}]}
+            yield f"data: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(sse_publisher(), media_type="text/event-stream")
+
+# ─── Uvicorn launcher ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080)

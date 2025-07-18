@@ -9,3 +9,4 @@ langchain_openai
 langchain-ibm
 duckduckgo-search
 ibm-watsonx-ai
+sse-starlette>=0.13.0
